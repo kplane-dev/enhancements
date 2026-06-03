@@ -161,7 +161,7 @@ No fork of `kplane-dev/storage` required. This matches how third-party admission
 - **The registry sits at `kplane-dev/storage/registry`** as a subpackage to keep clean references; `kplane-dev/storage` is already `package storage` and importing `k8s.io/apiserver/pkg/storage` from a same-named package, while legal, is noisy.
 - **`--storage-backend` is already upstream.** It's currently validated against `{"etcd3"}` (a hardcoded set in upstream `EtcdOptions.Validate`). Our apiserver's options validation widens the accepted set to `backends.Names()` and dispatches to the selected backend's `Validate`. The upstream flag binding itself is reused as-is.
 - **All backend flags are always exposed.** `--etcd-servers` is in `--help` even when `--storage-backend=spanner`, and vice versa. This matches how upstream handles `--encryption-provider-config`, `--audit-policy-file`, and the admission plugin flags: bind everything, dispatch at runtime. Flag groups (via pflag's `FlagSet`) can section the help output by backend.
-- **Etcd is a registered backend.** `kplane-dev/storage/backends/etcd/` is a thin wrapper that owns its own `--etcd-*` flag bindings and a `storagebackend.Config`, and whose `Build` returns a `Factory` calling upstream `factory.Create`. Cross-cutting storage-layer flags (`--storage-media-type`, `--watch-cache`, `--encryption-provider-config`, etc.) stay on upstream `EtcdOptions` (now a misnomer, but ours to move only if we fork) and are orthogonal to backend selection.
+- **Etcd is a registered backend, but its wrapper binds zero flags.** Upstream's `EtcdOptions` is already in the apiserver's options chain and owns every `--etcd-*` flag, `--storage-backend` itself, and the cross-cutting storage-layer flags (`--storage-media-type`, `--watch-cache`, `--encryption-provider-config`, etc.). The wrapper at `kplane-dev/storage/backends/etcd/` reads from that struct at `Build` time and delegates to upstream `factory.Create`. No fork modification, no duplicated flag definitions. Cross-cutting flags stay where they are and are orthogonal to backend selection by design.
 - **Spanner experiment migrates entirely.** `kplane-dev/spanner` is archived or left as a one-release re-export shim. The duplicate `BackendFactory` type currently in `kplane-dev/spanner/factory.go` ("to avoid an import cycle") becomes `registry.Factory`.
 
 ## Design details
@@ -356,73 +356,74 @@ func (o *Options) Build() (registry.Factory, error) {
 }
 ```
 
-The etcd wrapper has the same shape, but its `Build` delegates to upstream:
+The etcd wrapper looks similar but binds zero flags. Upstream's `EtcdOptions` is already in the apiserver's options chain and binds every `--etcd-*` flag, `--storage-backend` itself, and the cross-cutting storage flags (`--storage-media-type`, `--watch-cache`, `--encryption-provider-config`, etc.). The wrapper reads from that struct at `Build` time and delegates to upstream `factory.Create`:
 
 ```go
 // kplane-dev/storage/backends/etcd/options.go
 package etcd
 
 import (
+    "fmt"
+
     "github.com/spf13/pflag"
     "k8s.io/apimachinery/pkg/runtime"
     "k8s.io/apiserver/pkg/storage"
     "k8s.io/apiserver/pkg/storage/storagebackend"
     "k8s.io/apiserver/pkg/storage/storagebackend/factory"
+    upstreamoptions "k8s.io/apiserver/pkg/server/options"
 
     "kplane-dev/storage/registry"
 )
 
+// Options wraps upstream EtcdOptions so etcd participates in our registry like
+// any other backend. It does not bind its own flags: upstream's EtcdOptions
+// is already in the apiserver's options chain and owns every --etcd-* flag,
+// --storage-backend, and the cross-cutting storage flags. We just read its
+// resolved StorageConfig at Build time.
 type Options struct {
-    config storagebackend.Config  // upstream's typed config
+    upstream *upstreamoptions.EtcdOptions
 }
 
-func NewOptions() *Options {
-    return &Options{config: *storagebackend.NewDefaultConfig("/registry", nil)}
+func NewOptions(upstream *upstreamoptions.EtcdOptions) *Options {
+    return &Options{upstream: upstream}
 }
 
 func (o *Options) Name() string { return "etcd3" }
 
 func (o *Options) AddFlags(fs *pflag.FlagSet) {
-    fs.StringSliceVar(&o.config.Transport.ServerList, "etcd-servers", o.config.Transport.ServerList,
-        "List of etcd servers to connect with (scheme://ip:port), comma separated.")
-    fs.StringVar(&o.config.Prefix, "etcd-prefix", o.config.Prefix,
-        "The prefix to prepend to all resource paths in etcd.")
-    fs.StringVar(&o.config.Transport.KeyFile, "etcd-keyfile", o.config.Transport.KeyFile,
-        "SSL key file used to secure etcd communication.")
-    fs.StringVar(&o.config.Transport.CertFile, "etcd-certfile", o.config.Transport.CertFile,
-        "SSL certification file used to secure etcd communication.")
-    fs.StringVar(&o.config.Transport.TrustedCAFile, "etcd-cafile", o.config.Transport.TrustedCAFile,
-        "SSL CA file used to secure etcd communication.")
-    // ... timing / health flags ...
+    // No-op. Upstream EtcdOptions.AddFlags binds the --etcd-* flags from
+    // elsewhere in the apiserver's options chain. Binding them here would
+    // panic on duplicate registration.
 }
 
 func (o *Options) Validate() []error {
+    // Only the etcd-specific checks. Cross-cutting validation
+    // (storage-media-type allowlist, encryption-provider-config presence, etc.)
+    // remains on upstream EtcdOptions.Validate and is called unconditionally
+    // by the apiserver; those flags apply regardless of backend selection.
     var errs []error
-    if len(o.config.Transport.ServerList) == 0 {
+    if len(o.upstream.StorageConfig.Transport.ServerList) == 0 {
         errs = append(errs, fmt.Errorf("--etcd-servers must be specified when --storage-backend=etcd3"))
     }
     return errs
 }
 
 func (o *Options) Build() (registry.Factory, error) {
-    cfg := o.config  // copy
+    cfg := o.upstream.StorageConfig  // copy; upstream's typed Config
     return func(
         rfc *storagebackend.ConfigForResource,
         newFunc, newListFunc func() runtime.Object,
         resourcePrefix string,
     ) (storage.Interface, factory.DestroyFunc, error) {
-        // Merge our connection config into the per-resource config the
-        // apiserver provides (which carries codec, transformer, prefix, etc.),
-        // then delegate to upstream factory.Create.
-        merged := *rfc
-        merged.Transport = cfg.Transport
-        if merged.Prefix == "" {
-            merged.Prefix = cfg.Prefix
-        }
-        return factory.Create(merged, newFunc, newListFunc, resourcePrefix)
+        // The apiserver's per-resource ConfigForResource (codec, transformer,
+        // prefix, GroupResource) already carries everything the upstream
+        // factory needs. We just delegate.
+        return factory.Create(*rfc, newFunc, newListFunc, resourcePrefix)
     }, nil
 }
 ```
+
+The Spanner wrapper binds its own flags because nothing else does; the etcd wrapper doesn't because upstream already does. The `Backend` interface is uniform, but in-tree backends are free to no-op `AddFlags` when their flags live elsewhere.
 
 The aggregator:
 
@@ -431,16 +432,20 @@ The aggregator:
 package backends
 
 import (
+    upstreamoptions "k8s.io/apiserver/pkg/server/options"
+
     "kplane-dev/storage/backends/etcd"
     "kplane-dev/storage/backends/spanner"
     // "kplane-dev/storage/backends/postgres"  // future
     "kplane-dev/storage/registry"
 )
 
-// RegisterBuiltin installs the in-tree backends into b. External backends
-// call b.Register(<theirs>.NewOptions()) from a custom apiserver main.
-func RegisterBuiltin(b *registry.Backends) {
-    b.Register(etcd.NewOptions())
+// RegisterBuiltin installs the in-tree backends into b. The etcd wrapper
+// needs upstream's EtcdOptions so it can read --etcd-* values at Build time.
+// External backends call b.Register(<theirs>.NewOptions()) from a custom
+// apiserver main.
+func RegisterBuiltin(b *registry.Backends, etcdOpts *upstreamoptions.EtcdOptions) {
+    b.Register(etcd.NewOptions(etcdOpts))
     b.Register(spanner.NewOptions())
     // b.Register(postgres.NewOptions())
 }
@@ -458,11 +463,13 @@ import (
 )
 
 func main() {
-    backends := registry.New()
-    storagebackends.RegisterBuiltin(backends)
-    // (External backends would be added here in a custom build.)
+    opts := options.NewOptions()  // includes upstream EtcdOptions
 
-    opts := options.NewOptions(backends)
+    backends := registry.New()
+    storagebackends.RegisterBuiltin(backends, opts.Etcd)
+    // (External backends would be added here in a custom build.)
+    opts.Backends = backends
+
     cmd := app.NewServerCommand(opts)
     // ...
 }
@@ -577,7 +584,7 @@ Each backend's repo has a `conformance_test.go` that calls `conformance.Run`. Th
 | Hidden coupling in current Spanner code (the apiserver assumes Spanner-shaped state somewhere we haven't found). | The Spanner migration is the canary: anything that breaks is something we'd hit when adding the second backend anyway. Better to find it now. |
 | Flag explosion: `--help` lists every backend's flag block whether used or not. | Matches upstream's pattern for admission/encryption/auth. Mitigate readability with pflag flag groups so each backend's flags render in their own help section. Document that only the selected backend's flags take effect. |
 | Upstream `EtcdOptions.Validate()` checks `--etcd-servers` unconditionally, which would falsely fail when `--storage-backend=spanner`. | Our `Options.Validate` skips upstream's etcd-specific validation when a non-etcd backend is selected, and routes to the selected backend's `Validate()` instead. Upstream `EtcdOptions` continues to own cross-cutting flags (`--storage-media-type`, `--watch-cache`, etc.) that don't depend on backend choice. |
-| The `etcd` backend wrapper duplicates upstream's flag definitions for `--etcd-*`. | Real cost, small (~10 flag bindings in one file). Pays for itself by making etcd a first-class backend in the registry instead of a special case in dispatch logic. |
+| In-tree backends have asymmetric `AddFlags` (Spanner binds flags, etcd no-ops because upstream already binds them). | Documented in the `Backend` interface godoc: backends should bind their flags unless those flags are already owned elsewhere in the options chain. The asymmetry is honest about what's happening; pretending otherwise would mean duplicating upstream's `--etcd-*` bindings (which would panic on duplicate flag registration). |
 
 ## Alternatives considered
 
@@ -646,15 +653,13 @@ This is enough to prove the pattern: same Spanner behavior, identical operator U
 
 ## Open questions
 
-1. **Where do cross-cutting storage flags live?** Upstream `EtcdOptions` currently owns `--storage-media-type`, `--watch-cache`, `--encryption-provider-config`, etc., which are orthogonal to backend choice. Keep them on upstream `EtcdOptions` (simplest, but the naming is misleading), move them to a new `StorageOptions` struct on the apiserver side (cleaner, but more wiring), or wrap upstream `EtcdOptions` in a thin shim (compromise). Decide at MVP-PR time.
-
-2. **Does the etcd backend run upstream's `EtcdOptions.AddFlags` at all, or does it bind everything itself?** Running upstream's `AddFlags` pulls in cross-cutting flags as a side effect (see Q1), which we may or may not want. Binding everything ourselves means the etcd backend wrapper is ~30 flags instead of ~10. Choice tied to Q1.
+None blocking. The design assumes the etcd wrapper reads from the existing upstream `EtcdOptions` instance via dependency injection; if that proves awkward at implementation time (e.g., construction-order issues in the apiserver's options chain), the fallback is to have the apiserver pass the resolved `storagebackend.Config` to the wrapper after flag parse rather than at construction. Mechanical change, no design impact.
 
 ## Drawbacks
 
 - **One more layer.** A reader tracing "where does the apiserver get its storage" follows `main` → `RegisterBuiltin` → `Get` → `Build` → `Factory` instead of seeing a literal `NewSpannerStore(...)` call. Mitigated by the registry being ~80 lines of obvious code and the aggregator file listing every supported backend.
 - **Flag explosion in `--help`.** Operators see every backend's flag block whether they use it or not. Matches upstream's behavior for admission/encryption/auth, but `kube-apiserver --help` is already 200+ lines and we're adding to it. pflag flag groups mitigate.
-- **Etcd wrapper duplicates upstream's `--etcd-*` flag bindings.** ~10 flag declarations in one file. Real cost, small. Pays for itself by keeping etcd in the same abstraction as every other backend.
+- **Asymmetric `AddFlags` between in-tree backends.** Spanner binds its own flags; etcd no-ops because upstream's `EtcdOptions` already binds them from the existing apiserver options chain. This is honest about what's happening (avoids duplicate-flag panics) but means readers have to know the convention.
 - **The conformance suite is a long-tail commitment.** Every contract subtlety we discover becomes a new test, and every backend has to keep passing. This is desired (we *want* that gate) but not free.
 
 ## History
@@ -662,3 +667,4 @@ This is enough to prove the pattern: same Spanner behavior, identical operator U
 - 2026-05-29: Initial draft (@zachsmith).
 - 2026-06-02: Reworked against research findings (@zachsmith). Path A (modifying fork) moved to rejected alternatives. Factory signature aligned with upstream `factory.Create`. Registry instance-scoped (admission-style), not global. Backends collocated under `kplane-dev/storage/backends/<name>/`.
 - 2026-06-02 (later): Configuration shape switched from YAML config file (`--storage-config`) to per-backend CLI flags, matching upstream's `--etcd-*` precedent. Etcd promoted to a registered backend (`backends/etcd/`) instead of a special case. External-backend story switched from forking the in-tree aggregator to extending a custom apiserver `main`.
+- 2026-06-02 (later still): Etcd wrapper no longer binds its own `--etcd-*` flags. Upstream `EtcdOptions` already binds them via the existing apiserver options chain; the wrapper just reads from that struct at `Build` time. Resolves both prior Open Questions (cross-cutting flags stay on upstream `EtcdOptions`; etcd wrapper's `AddFlags` is a no-op).
