@@ -5,7 +5,7 @@
 | **Status** | `provisional` |
 | **Authors** | @zachsmith |
 | **Created** | 2026-05-29 |
-| **Last updated** | 2026-06-02 |
+| **Last updated** | 2026-06-03 |
 | **Tracking issue** | TBD |
 | **Affected repos** | `kplane-dev/storage` (registry, in-tree backends), `kplane-dev/apiserver`, (archived) `kplane-dev/spanner` |
 | **Supersedes** | N/A |
@@ -35,12 +35,12 @@ Cost of not graduating now:
 2. Backend factories reuse the existing upstream `factory.Create` signature so they slot into the per-resource decoder pipeline without contract reinvention.
 3. The apiserver selects a backend via the existing upstream `--storage-backend=<name>` flag. Each backend owns its own flag block, prefixed by the backend name, exactly the way `--etcd-*` flags belong to etcd today.
 4. Etcd is a registered backend in the registry, not a special case. The default path (`--storage-backend=etcd3` or unset) goes through the same lookup as every other backend.
-5. A conformance suite proves any registered backend satisfies the contract upstream `storage.Interface` consumers expect. It extends `k8s.io/apiserver/pkg/storage/testing` (the existing upstream test utilities) rather than reimplementing them.
+5. A conformance suite proves any registered backend satisfies the contract upstream `storage.Interface` consumers expect. It reuses the `RunTest*` helpers in `k8s.io/apiserver/pkg/storage/testing` (used to test etcd3 itself; sourced from the fork's staging tree via a `replace` directive since they aren't in the apiserver's vendored deps) rather than reimplementing them.
 6. The Spanner experiment migrates into the new location as the first non-etcd registered backend, behavior unchanged. `--spanner-*` flags remain canonical (not deprecated).
 
 ### Non-goals
 
-1. **Modifying the upstream fork.** Upstream rejected pluggable storage years ago (kubernetes/kubernetes#1957); kubernetes/enhancements#172 has been in limbo for ~8 years. The fork is exemplary minimal today (2 commits, 15 files, all about multicluster identity). Patching `storagebackend/factory/factory.go` would add permanent rebase tax across 5 parallel switches (`Create`, `CreateHealthCheck`, `CreateReadyCheck`, `CreateProber`, `CreateMonitor`) for zero upstream value.
+1. **Modifying the upstream fork.** Upstream's long-stuck issues on this (kubernetes/kubernetes#1957, closed; kubernetes/enhancements#172, marked in-development with no forward motion) suggest there's no near-term appetite for a pluggable-storage KEP. Our fork is intentionally minimal today (2 commits across 17 file modifications, all about multicluster identity). Patching `storagebackend/factory/factory.go` would add permanent rebase tax across 5 parallel switches (`Create`, `CreateHealthCheck`, `CreateReadyCheck`, `CreateProber`, `CreateMonitor`) for speculative upstream value.
 2. **A YAML config file for backend configuration.** Upstream doesn't use one for storage; only for things that are structured (encryption providers per resource, admission plugin chains, structured auth config). Storage is "one backend per process," which fits naturally as CLI flags. The encryption-provider-config precedent is a red herring once we look at how `--etcd-*` is actually shaped.
 3. **Writing a postgres-native backend.** Obvious next backend after the registry lands, but separate KPEP.
 4. **Replacing kine.** kine stays a valid choice; this KPEP makes it one option among many rather than the only non-etcd path.
@@ -534,14 +534,18 @@ The existing `--spanner-*` flags continue to work; their bindings move from the 
 
 ### Conformance suite
 
-Upstream already has `k8s.io/apiserver/pkg/storage/testing` with `TestCreate`, `TestGet`, `TestWatch`, `TestList`, `TestGuaranteedUpdate`, etc. that it uses to test etcd3. The conformance suite imports these and adds the cases not covered:
+Upstream's apiserver source tree (`staging/src/k8s.io/apiserver/pkg/storage/testing/`) has a reusable contract test suite for `storage.Interface` consumers, used to test etcd3 itself. The exported entry points are named `RunTestCreate`, `RunTestGet`, `RunTestList`, `RunTestConsistentList`, `RunTestGuaranteedUpdate`, `RunTestStats`, and a watch-tests file with `RunTestWatch*` variants. Note these are not vendored into the apiserver's `vendor/` tree (the apiserver doesn't import them); the conformance package pulls them in from the fork's staging copy via a `replace` directive in `kplane-dev/storage/go.mod`.
+
+Our conformance suite wraps each `RunTest*` so backends call one entry point, plus adds the multicluster cases that upstream doesn't cover:
 
 ```go
 // kplane-dev/storage/conformance/suite.go
 package conformance
 
 import (
+    "context"
     "testing"
+
     "k8s.io/apiserver/pkg/storage"
     storagetesting "k8s.io/apiserver/pkg/storage/testing"
 )
@@ -559,14 +563,25 @@ type Backend struct {
 }
 
 func Run(t *testing.T, b Backend) {
-    t.Run("upstream", func(t *testing.T) { runUpstreamSuite(t, b, storagetesting.RunTests) })
-    t.Run("multicluster/identity", func(t *testing.T) { testIdentity(t, b) })
+    ctx := context.Background()
+    t.Run("upstream/Create", func(t *testing.T) {
+        s, cleanup := b.New(t); defer cleanup()
+        storagetesting.RunTestCreate(ctx, t, s, nil)
+    })
+    t.Run("upstream/Get",   func(t *testing.T) { /* RunTestGet */ })
+    t.Run("upstream/List",  func(t *testing.T) { /* RunTestList */ })
+    t.Run("upstream/GuaranteedUpdate", func(t *testing.T) { /* RunTestGuaranteedUpdate */ })
+    t.Run("upstream/Watch", func(t *testing.T) { /* RunTestWatch */ })
+
+    // Our additions
+    t.Run("multicluster/identity",     func(t *testing.T) { testIdentity(t, b) })
     t.Run("multicluster/keyIsolation", func(t *testing.T) { testKeyIsolation(t, b) })
-    t.Run("watch/ordering-under-concurrent-writes", func(t *testing.T) { testWatchOrdering(t, b) })
 }
 ```
 
 Each backend's repo has a `conformance_test.go` that calls `conformance.Run`. That's the merge gate for a backend.
+
+Note: some `RunTest*` functions take additional parameters (e.g., `RunTestList` takes a `Compaction` callback and a `KubernetesRecorder`, `RunTestGuaranteedUpdate` takes an `InterfaceWithPrefixTransformer`). Backends that can't satisfy a given dependency skip that test with `t.Skip` documenting why; the conformance harness exposes hooks for the harness to provide these where the backend supports them.
 
 ### Test plan
 
@@ -593,8 +608,8 @@ Each backend's repo has a `conformance_test.go` that calls `conformance.Run`. Th
 Replace the `switch` in `vendor/k8s.io/apiserver/pkg/storage/storagebackend/factory/factory.go` with a registered map, add a `Register` function, and migrate `CreateHealthCheck`, `CreateReadyCheck`, `CreateProber`, `CreateMonitor` to the same pattern.
 
 **Rejected because:**
-- The fork is intentionally minimal (2 commits, 15 files, all about multicluster identity). Modifying `factory.go` breaks the minimalism rule. Five parallel switches means five rebase points each upstream release.
-- The upstream community has explicitly rejected pluggable storage (kubernetes/kubernetes#1957). Enhancement #172 ("alternative storage backend") has been stuck in `provisional` for ~8 years. The KEP candidacy framing for this approach is dead on arrival; SIG API Machinery's stated position is "use kine."
+- The fork is intentionally minimal (2 commits across 17 file modifications, all about multicluster identity). Modifying `factory.go` breaks the minimalism rule. Five parallel switches means five rebase points each upstream release.
+- Upstream community appetite is low: kubernetes/kubernetes#1957 (the canonical pluggable-storage issue) is closed, kubernetes/enhancements#172 is marked in-development with no forward motion, and the de facto direction has been "use kine" for any non-etcd story. A KEP from us would be unlikely to land soon.
 - This proposal sits above the fork at the `RESTOptionsGetter` / `StorageDecorator` layer, which is where our multicluster work *already* lives. We get the same outcome with zero fork modification.
 
 ### Alternative B: Single `--storage-config=<file.yaml>` configuration file
@@ -607,7 +622,7 @@ Define a `StorageConfiguration` YAML schema with per-backend typed blocks (or `R
 
 Each backend ships internal + external types, conversion, defaults, validation, and generated code (deepcopy/conversion/defaulter). Matches the `eventratelimit` admission plugin pattern.
 
-**Rejected because:** ~700 LOC and 10 files per backend type. Upstream itself only uses this when shipping a durable user-facing API surface (kubelet config, scheduler config). For per-plugin internal config, upstream uses plain Go structs (`audit/buffered.BatchConfig` is the closest analog). With CLI flags we don't even need plain structs to be `runtime.Object`-shaped; they're just options structs.
+**Rejected because:** ~17 files and ~500 hand-written LOC per backend type (eventratelimit, the canonical example, has 5 root files + 8 in `v1alpha1/` + install + validation). Upstream itself only uses this when shipping a durable user-facing API surface (kubelet config, scheduler config). For per-plugin internal config, upstream uses plain Go structs (`audit/buffered.BatchConfig` is the closest analog). With CLI flags we don't even need plain structs to be `runtime.Object`-shaped; they're just options structs.
 
 ### Alternative D: Use kine for everything non-etcd
 
@@ -668,3 +683,4 @@ None blocking. The design assumes the etcd wrapper reads from the existing upstr
 - 2026-06-02: Reworked against research findings (@zachsmith). Path A (modifying fork) moved to rejected alternatives. Factory signature aligned with upstream `factory.Create`. Registry instance-scoped (admission-style), not global. Backends collocated under `kplane-dev/storage/backends/<name>/`.
 - 2026-06-02 (later): Configuration shape switched from YAML config file (`--storage-config`) to per-backend CLI flags, matching upstream's `--etcd-*` precedent. Etcd promoted to a registered backend (`backends/etcd/`) instead of a special case. External-backend story switched from forking the in-tree aggregator to extending a custom apiserver `main`.
 - 2026-06-02 (later still): Etcd wrapper no longer binds its own `--etcd-*` flags. Upstream `EtcdOptions` already binds them via the existing apiserver options chain; the wrapper just reads from that struct at `Build` time. Resolves both prior Open Questions (cross-cutting flags stay on upstream `EtcdOptions`; etcd wrapper's `AddFlags` is a no-op).
+- 2026-06-03: Factual cleanup after agent verification. Corrected fork stats (2 commits across 17 file modifications, not "2 commits, 15 files"). Softened upstream-community claims (no formal "stated position" from SIG API Machinery; #1957 closed, #172 in-development with no motion). Fixed the conformance-suite description: the `storage/testing` package lives in the fork's staging tree (not vendored into the apiserver); exported helpers are `RunTestX`, called from backends' own `Test*` functions. Adjusted `runtime.Scheme`-config cost estimate (~17 files / ~500 LOC, not ~10 / ~700).
